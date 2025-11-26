@@ -37,12 +37,12 @@ In sports, every centimeter and every second matter. This repository provides st
 ### Player Radar & Tactical View
 Real-time tactical analysis with player positioning on a mini-map:
 
-https://github.com/user-attachments/assets/radar_clean.mp4
+https://github.com/user-attachments/assets/134b2003-bbb1-4efb-bdb2-e0adfec90aa1
 
 ### Ball Trajectory Tracking
 Advanced ball tracking with trajectory visualization:
 
-https://github.com/user-attachments/assets/ball_trajectory.mp4
+https://github.com/user-attachments/assets/7ff610443-f0bd-4c4d-a0c5-cc7b8f54c206
 
 > **Note**: For full demo videos, check the `examples/soccer/output/` directory after running the examples.
 
