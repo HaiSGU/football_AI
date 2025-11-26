@@ -25,8 +25,29 @@ Are you also a fan of computer vision and sports?  We welcome contributions from
 We don't have a Python package yet. Install from source in a
 [**Python>=3.8**](https://www.python.org/) environment.
 
+### Quick Install
+
 ```bash
 pip install git+https://github.com/roboflow/sports.git
+```
+
+### Windows Users
+
+This project is **fully compatible with Windows 10/11**! For detailed Windows setup instructions including:
+- GPU acceleration with CUDA
+- OpenCV configuration
+- Troubleshooting common issues
+
+See the [Soccer AI README](examples/soccer/README.md) for complete Windows installation guide.
+
+**Quick Windows Setup:**
+```cmd
+pip install git+https://github.com/roboflow/sports.git
+cd examples\soccer
+pip install -r requirements.txt gdown
+pip uninstall opencv-python-headless -y
+pip install opencv-python==4.10.0.84
+.\setup.ps1  # or setup.bat
 ```
 
 ## ⚽ datasets
