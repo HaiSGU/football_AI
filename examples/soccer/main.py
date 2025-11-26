@@ -9,7 +9,11 @@ import supervision as sv
 from tqdm import tqdm
 from ultralytics import YOLO
 
-from sports.annotators.soccer import draw_pitch, draw_points_on_pitch
+from sports.annotators.soccer import (
+    draw_pitch,
+    draw_points_on_pitch,
+    draw_paths_on_pitch,
+)
 from sports.common.ball import BallTracker, BallAnnotator
 from sports.common.team import TeamClassifier
 from sports.common.view import ViewTransformer
@@ -81,6 +85,7 @@ class Mode(Enum):
     PLAYER_TRACKING = "PLAYER_TRACKING"
     TEAM_CLASSIFICATION = "TEAM_CLASSIFICATION"
     RADAR = "RADAR"
+    BALL_TRAJECTORY = "BALL_TRAJECTORY"
 
 
 def get_crops(frame: np.ndarray, detections: sv.Detections) -> List[np.ndarray]:
@@ -128,9 +133,41 @@ def resolve_goalkeepers_team_id(
     return np.array(goalkeepers_team_id)
 
 
-def render_radar(
-    detections: sv.Detections, keypoints: sv.KeyPoints, color_lookup: np.ndarray
+def render_ball_trajectory(
+    keypoints: sv.KeyPoints, ball_trajectory: List[np.ndarray]
 ) -> np.ndarray:
+    """Render only ball trajectory on pitch (no players, no Voronoi)"""
+    mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
+    transformer = ViewTransformer(
+        source=keypoints.xy[0][mask].astype(np.float32),
+        target=np.array(CONFIG.vertices)[mask].astype(np.float32),
+    )
+
+    radar = draw_pitch(config=CONFIG)
+
+    # Draw ball trajectory only
+    if ball_trajectory is not None and len(ball_trajectory) > 0:
+        ball_xy = np.array([pos for pos in ball_trajectory if pos.size > 0])
+        if len(ball_xy) > 0:
+            transformed_ball_xy = transformer.transform_points(points=ball_xy)
+            radar = draw_paths_on_pitch(
+                config=CONFIG,
+                paths=[transformed_ball_xy],
+                color=sv.Color.WHITE,
+                thickness=3,
+                pitch=radar,
+            )
+
+    return radar
+
+
+def render_radar(
+    detections: sv.Detections,
+    keypoints: sv.KeyPoints,
+    color_lookup: np.ndarray,
+    ball_trajectory_world: List[np.ndarray] = None,
+) -> np.ndarray:
+    """Render radar with ball trajectory already in world coordinates"""
     mask = (keypoints.xy[0][:, 0] > 1) & (keypoints.xy[0][:, 1] > 1)
     transformer = ViewTransformer(
         source=keypoints.xy[0][mask].astype(np.float32),
@@ -140,6 +177,17 @@ def render_radar(
     transformed_xy = transformer.transform_points(points=xy)
 
     radar = draw_pitch(config=CONFIG)
+
+    # Draw ball trajectory if available (already in world coordinates)
+    if ball_trajectory_world is not None and len(ball_trajectory_world) > 0:
+        radar = draw_paths_on_pitch(
+            config=CONFIG,
+            paths=[ball_trajectory_world],
+            color=sv.Color.WHITE,
+            thickness=3,
+            pitch=radar,
+        )
+
     radar = draw_points_on_pitch(
         config=CONFIG,
         xy=transformed_xy[color_lookup == 0],
@@ -240,7 +288,6 @@ def run_ball_detection(source_video_path: str, device: str) -> Iterator[np.ndarr
 
     slicer = sv.InferenceSlicer(
         callback=callback,
-        overlap_filter_strategy=sv.OverlapFilter.NONE,
         slice_wh=(640, 640),
     )
 
@@ -345,8 +392,13 @@ def run_team_classification(
 
 
 def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+    from collections import deque
+
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+
+    MAXLEN = 5
+
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE
     )
@@ -360,11 +412,26 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     team_classifier = TeamClassifier(device=device)
     team_classifier.fit(crops)
 
+    M = deque(maxlen=MAXLEN)
+
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
-        keypoints = sv.KeyPoints.from_ultralytics(result)
+        key_points = sv.KeyPoints.from_ultralytics(result)
+
+        # Apply ViewTransformer smoothing
+        filter = key_points.confidence[0] > 0.5
+        frame_reference_points = key_points.xy[0][filter]
+        pitch_reference_points = np.array(CONFIG.vertices)[filter]
+
+        transformer = ViewTransformer(
+            source=frame_reference_points, target=pitch_reference_points
+        )
+        M.append(transformer.m)
+        transformer.m = np.mean(np.array(M), axis=0)
+
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
         detections = tracker.update_with_detections(detections)
@@ -397,13 +464,160 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         )
 
         h, w, _ = frame.shape
-        radar = render_radar(detections, keypoints, color_lookup)
+        # Transform player positions with smoothed transformer
+        xy = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+        transformed_xy = transformer.transform_points(points=xy)
+
+        radar = draw_pitch(config=CONFIG)
+        radar = draw_points_on_pitch(
+            config=CONFIG,
+            xy=transformed_xy[color_lookup == 0],
+            face_color=sv.Color.from_hex(COLORS[0]),
+            radius=20,
+            pitch=radar,
+        )
+        radar = draw_points_on_pitch(
+            config=CONFIG,
+            xy=transformed_xy[color_lookup == 1],
+            face_color=sv.Color.from_hex(COLORS[1]),
+            radius=20,
+            pitch=radar,
+        )
+        radar = draw_points_on_pitch(
+            config=CONFIG,
+            xy=transformed_xy[color_lookup == 2],
+            face_color=sv.Color.from_hex(COLORS[2]),
+            radius=20,
+            pitch=radar,
+        )
+        radar = draw_points_on_pitch(
+            config=CONFIG,
+            xy=transformed_xy[color_lookup == 3],
+            face_color=sv.Color.from_hex(COLORS[3]),
+            radius=20,
+            pitch=radar,
+        )
+
         radar = sv.resize_image(radar, (w // 2, h // 2))
         radar_h, radar_w, _ = radar.shape
         rect = sv.Rect(
             x=w // 2 - radar_w // 2, y=h - radar_h, width=radar_w, height=radar_h
         )
         annotated_frame = sv.draw_image(annotated_frame, radar, opacity=0.5, rect=rect)
+        yield annotated_frame
+
+
+def run_ball_trajectory(source_video_path: str, device: str) -> Iterator[np.ndarray]:
+    """
+    Run ball trajectory visualization - EXACT implementation from Roboflow notebook.
+    Shows ONLY ball path on pitch, yields video frames.
+    """
+    from collections import deque
+    from typing import Union
+
+    pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
+
+    BALL_ID = 0
+    MAXLEN = 5
+    MAX_DISTANCE_THRESHOLD = 500
+
+    frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+
+    path_raw = []
+    M = deque(maxlen=MAXLEN)
+    frames_list = []
+
+    def replace_outliers_based_on_distance(
+        positions: list[np.ndarray], distance_threshold: float
+    ) -> list[np.ndarray]:
+        last_valid_position: Union[np.ndarray, None] = None
+        cleaned_positions: list[np.ndarray] = []
+
+        for position in positions:
+            if len(position) == 0:
+                cleaned_positions.append(position)
+            else:
+                if last_valid_position is None:
+                    cleaned_positions.append(position)
+                    last_valid_position = position
+                else:
+                    distance = np.linalg.norm(position - last_valid_position)
+                    if distance > distance_threshold:
+                        cleaned_positions.append(np.array([], dtype=np.float64))
+                    else:
+                        cleaned_positions.append(position)
+                        last_valid_position = position
+
+        return cleaned_positions
+
+    # First pass: collect all ball positions and frames
+    for frame in frame_generator:
+        frames_list.append(frame)
+
+        # Detect ball
+        result = ball_detection_model(frame, imgsz=1280, verbose=False)[0]
+        detections = sv.Detections.from_ultralytics(result)
+
+        ball_detections = detections[detections.class_id == BALL_ID]
+        ball_detections.xyxy = sv.pad_boxes(xyxy=ball_detections.xyxy, px=10)
+
+        # Detect pitch keypoints
+        result = pitch_detection_model(frame, verbose=False)[0]
+        key_points = sv.KeyPoints.from_ultralytics(result)
+
+        filter = key_points.confidence[0] > 0.5
+        frame_reference_points = key_points.xy[0][filter]
+        pitch_reference_points = np.array(CONFIG.vertices)[filter]
+
+        transformer = ViewTransformer(
+            source=frame_reference_points, target=pitch_reference_points
+        )
+        M.append(transformer.m)
+        transformer.m = np.mean(np.array(M), axis=0)
+
+        frame_ball_xy = ball_detections.get_anchors_coordinates(
+            sv.Position.BOTTOM_CENTER
+        )
+        pitch_ball_xy = transformer.transform_points(points=frame_ball_xy)
+
+        path_raw.append(pitch_ball_xy)
+
+    # Process path
+    path = [
+        np.empty((0, 2), dtype=np.float32) if coordinates.shape[0] >= 2 else coordinates
+        for coordinates in path_raw
+    ]
+
+    path = [coordinates.flatten() for coordinates in path]
+    path = replace_outliers_based_on_distance(path, MAX_DISTANCE_THRESHOLD)
+
+    # Second pass: generate video frames with cumulative trajectory
+    for frame_idx, frame in enumerate(frames_list):
+        # Get cumulative path up to current frame
+        cumulative_path = path[: frame_idx + 1]
+
+        # Draw trajectory on pitch
+        pitch_frame = draw_pitch(CONFIG)
+        pitch_frame = draw_paths_on_pitch(
+            config=CONFIG,
+            paths=[cumulative_path],
+            color=sv.Color.WHITE,
+            thickness=3,
+            pitch=pitch_frame,
+        )
+
+        # Overlay on original frame
+        h, w, _ = frame.shape
+        pitch_resized = sv.resize_image(pitch_frame, (w // 2, h // 2))
+        pitch_h, pitch_w, _ = pitch_resized.shape
+        rect = sv.Rect(
+            x=w // 2 - pitch_w // 2, y=h - pitch_h, width=pitch_w, height=pitch_h
+        )
+        annotated_frame = sv.draw_image(
+            frame.copy(), pitch_resized, opacity=0.5, rect=rect
+        )
+
         yield annotated_frame
 
 
@@ -436,6 +650,10 @@ def main(
         )
     elif mode == Mode.RADAR:
         frame_generator = run_radar(source_video_path=source_video_path, device=device)
+    elif mode == Mode.BALL_TRAJECTORY:
+        frame_generator = run_ball_trajectory(
+            source_video_path=source_video_path, device=device
+        )
     else:
         raise NotImplementedError(f"Mode {mode} is not implemented.")
 
