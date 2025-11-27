@@ -396,8 +396,10 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
 
     player_detection_model = YOLO(PLAYER_DETECTION_MODEL_PATH).to(device=device)
     pitch_detection_model = YOLO(PITCH_DETECTION_MODEL_PATH).to(device=device)
+    ball_detection_model = YOLO(BALL_DETECTION_MODEL_PATH).to(device=device)
 
-    MAXLEN = 5
+    MAXLEN = 10  # Increased for smoother transformation
+    BALL_ID = 0
 
     frame_generator = sv.get_video_frames_generator(
         source_path=source_video_path, stride=STRIDE
@@ -413,9 +415,20 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
     team_classifier.fit(crops)
 
     M = deque(maxlen=MAXLEN)
+    ball_tracker = BallTracker(buffer_size=20)
 
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     tracker = sv.ByteTrack(minimum_consecutive_frames=3)
+
+    # Ball detection callback for InferenceSlicer
+    def ball_callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    ball_slicer = sv.InferenceSlicer(
+        callback=ball_callback,
+        slice_wh=(640, 640),
+    )
 
     for frame in frame_generator:
         result = pitch_detection_model(frame, verbose=False)[0]
@@ -431,6 +444,11 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         )
         M.append(transformer.m)
         transformer.m = np.mean(np.array(M), axis=0)
+
+        # Detect ball with smoothing
+        ball_detections = ball_slicer(frame).with_nms(threshold=0.1)
+        ball_detections = ball_detections[ball_detections.class_id == BALL_ID]
+        ball_detections = ball_tracker.update(ball_detections)
 
         result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(result)
@@ -469,6 +487,20 @@ def run_radar(source_video_path: str, device: str) -> Iterator[np.ndarray]:
         transformed_xy = transformer.transform_points(points=xy)
 
         radar = draw_pitch(config=CONFIG)
+
+        # Draw ball on radar if detected
+        if len(ball_detections) > 0:
+            ball_xy = ball_detections.get_anchors_coordinates(sv.Position.BOTTOM_CENTER)
+            transformed_ball_xy = transformer.transform_points(points=ball_xy)
+            radar = draw_points_on_pitch(
+                config=CONFIG,
+                xy=transformed_ball_xy,
+                face_color=sv.Color.WHITE,
+                radius=15,
+                pitch=radar,
+            )
+
+        # Draw players on radar
         radar = draw_points_on_pitch(
             config=CONFIG,
             xy=transformed_xy[color_lookup == 0],
